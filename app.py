@@ -102,7 +102,7 @@ def health(): return jsonify({"status":"ok"})
 
 @app.route("/api/info", methods=["POST"])
 def api_info():
-    url = (request.json or {}).get("url","").strip()
+    url = clean_youtube_url((request.json or {}).get("url","").strip())
     if not url: return jsonify({"error":"URL requerida"}),400
     try: return jsonify(get_info(url))
     except RuntimeError as e: return jsonify({"error":str(e)}),400
@@ -140,3 +140,10 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT",5000))
     print(f"\n YTDown API → http://localhost:{port}\n")
     app.run(host="0.0.0.0",port=port)
+
+
+def clean_youtube_url(url):
+    vid = extract_id(url)
+    if not vid:
+        return url
+    return f"https://www.youtube.com/watch?v={vid}"
