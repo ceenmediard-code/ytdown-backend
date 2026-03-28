@@ -1,4 +1,12 @@
 import os, json, re, threading, uuid, subprocess, requests
+
+# ── Register static ffmpeg binary before anything else ────────────────────────
+try:
+    import static_ffmpeg
+    static_ffmpeg.add_paths()
+except Exception:
+    pass
+
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
@@ -49,34 +57,32 @@ def cobalt_get_link(url, quality="1080", audio_only=False, audio_format="mp3"):
     raise RuntimeError(last_err)
 
 
-def ytdlp_download_direct(job_id, url, quality, audio_only, audio_format):
+def ytdlp_download(job_id, url, quality, audio_only, audio_format):
     jobs[job_id]["status"] = "downloading"
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{job_id}_%(title).60s.%(ext)s")
 
     if audio_only:
-        # Audio only — no ffmpeg needed for most formats
         cmd = ["yt-dlp", "--no-playlist",
                "-f", "bestaudio/best",
                "-x", "--audio-format", audio_format,
                "--audio-quality", "0",
                "--output", out_tmpl, "--newline", url]
     else:
-        # Use format that doesn't require merging (single file)
-        # bestvideo+bestaudio requires ffmpeg; best[ext=mp4] does NOT
         h = quality
-        fmt = (
-            f"bestvideo[height<={h}][ext=mp4][acodec!=none]"          # video+audio in one mp4
-            f"/best[height<={h}][ext=mp4]"                             # best single mp4
-            f"/bestvideo[height<={h}]+bestaudio"                       # merge (needs ffmpeg)
-            f"/best[height<={h}]"                                      # absolute fallback
-        )
+        # Priority: single mp4 file with audio → merge → best available
+        fmt = (f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
+               f"/bestvideo[height<={h}]+bestaudio"
+               f"/best[height<={h}][ext=mp4]"
+               f"/best[height<={h}]")
         cmd = ["yt-dlp", "--no-playlist",
                "-f", fmt,
+               "--merge-output-format", "mp4",
                "--output", out_tmpl, "--newline", url]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     for line in proc.stdout:
+        line = line.strip()
         if "[download]" in line and "%" in line:
             try:
                 pct = float(line.split("%")[0].split()[-1])
@@ -86,7 +92,7 @@ def ytdlp_download_direct(job_id, url, quality, audio_only, audio_format):
     proc.wait()
 
     if proc.returncode != 0:
-        raise RuntimeError("yt-dlp no pudo descargar este video.")
+        raise RuntimeError("yt-dlp no pudo descargar el video.")
 
     for f in sorted(os.listdir(DOWNLOAD_DIR)):
         if f.startswith(job_id + "_"):
@@ -99,12 +105,11 @@ def ytdlp_download_direct(job_id, url, quality, audio_only, audio_format):
 
 def download_worker(job_id, url, quality, audio_only, audio_format):
     try:
-        # 1) Try cobalt first
+        # 1) Try cobalt
         try:
             cobalt_url, filename = cobalt_get_link(
                 url, quality=quality, audio_only=audio_only,
                 audio_format=audio_format)
-
             jobs[job_id]["status"] = "downloading"
             out = os.path.join(DOWNLOAD_DIR, f"{job_id}_{filename}")
             with requests.get(cobalt_url, stream=True, timeout=180,
@@ -123,10 +128,10 @@ def download_worker(job_id, url, quality, audio_only, audio_format):
                                  "file": out, "filename": filename})
             return
         except Exception:
-            pass  # cobalt failed → try yt-dlp
+            pass  # cobalt failed → fallback
 
-        # 2) Fallback: yt-dlp direct download (no ffmpeg required)
-        ytdlp_download_direct(job_id, url, quality, audio_only, audio_format)
+        # 2) yt-dlp fallback
+        ytdlp_download(job_id, url, quality, audio_only, audio_format)
 
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
@@ -178,29 +183,23 @@ def get_info(url):
 
 
 @app.route("/")
-def root():
-    return jsonify({"status": "YTDown API running"})
+def root(): return jsonify({"status": "YTDown API running"})
 
 @app.route("/api/health")
-def health():
-    return jsonify({"status": "ok"})
+def health(): return jsonify({"status": "ok"})
 
 @app.route("/api/info", methods=["POST"])
 def api_info():
     url = (request.json or {}).get("url", "").strip()
-    if not url:
-        return jsonify({"error": "URL requerida"}), 400
-    try:
-        return jsonify(get_info(url))
-    except RuntimeError as e:
-        return jsonify({"error": str(e)}), 400
+    if not url: return jsonify({"error": "URL requerida"}), 400
+    try: return jsonify(get_info(url))
+    except RuntimeError as e: return jsonify({"error": str(e)}), 400
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
     d = request.json or {}
     url = d.get("url", "").strip()
-    if not url:
-        return jsonify({"error": "URL requerida"}), 400
+    if not url: return jsonify({"error": "URL requerida"}), 400
     quality = QUALITY_MAP.get(d.get("quality_id", "720p"), "720")
     audio_only = d.get("audio_only", False)
     audio_format = AUDIO_MAP.get(d.get("audio_format", "mp3"), "mp3")
@@ -214,8 +213,7 @@ def api_download():
 @app.route("/api/status/<job_id>")
 def api_status(job_id):
     j = jobs.get(job_id)
-    if not j:
-        return jsonify({"error": "No encontrado"}), 404
+    if not j: return jsonify({"error": "No encontrado"}), 404
     return jsonify({"status": j["status"], "progress": j["progress"],
                     "filename": j["filename"], "error": j["error"]})
 
