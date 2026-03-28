@@ -31,7 +31,6 @@ def cobalt_get_link(url, quality="1080", audio_only=False, audio_format="mp3"):
     else:
         payload = {"url": url, "videoQuality": quality,
                    "downloadMode": "auto", "filenameStyle": "pretty"}
-
     last_err = "Ningún servidor cobalt respondió."
     for inst in COBALT_INSTANCES:
         try:
@@ -41,36 +40,38 @@ def cobalt_get_link(url, quality="1080", audio_only=False, audio_format="mp3"):
                 d = r.json()
                 st = d.get("status", "")
                 if st in ("tunnel", "redirect", "stream"):
-                    fname = d.get("filename") or "video.mp4"
-                    return d["url"], fname
-                elif st == "error":
-                    last_err = "cobalt: " + str(d.get("error", {}).get("code", "error"))
-                else:
-                    last_err = f"status inesperado: {st}"
+                    return d["url"], d.get("filename") or "video.mp4"
+                last_err = "cobalt: " + str(d.get("error", {}).get("code", st))
             else:
-                last_err = f"HTTP {r.status_code} ({inst})"
+                last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = str(e)
     raise RuntimeError(last_err)
 
 
 def ytdlp_download_direct(job_id, url, quality, audio_only, audio_format):
-    """Download directly with yt-dlp (fallback when cobalt fails)."""
     jobs[job_id]["status"] = "downloading"
-    h = quality
-
     out_tmpl = os.path.join(DOWNLOAD_DIR, f"{job_id}_%(title).60s.%(ext)s")
 
     if audio_only:
-        cmd = ["yt-dlp", "--no-playlist", "-x",
-               "--audio-format", audio_format,
+        # Audio only — no ffmpeg needed for most formats
+        cmd = ["yt-dlp", "--no-playlist",
+               "-f", "bestaudio/best",
+               "-x", "--audio-format", audio_format,
                "--audio-quality", "0",
                "--output", out_tmpl, "--newline", url]
     else:
-        fmt = (f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-               f"/best[height<={h}][ext=mp4]/best[height<={h}]")
-        cmd = ["yt-dlp", "--no-playlist", "-f", fmt,
-               "--merge-output-format", "mp4",
+        # Use format that doesn't require merging (single file)
+        # bestvideo+bestaudio requires ffmpeg; best[ext=mp4] does NOT
+        h = quality
+        fmt = (
+            f"bestvideo[height<={h}][ext=mp4][acodec!=none]"          # video+audio in one mp4
+            f"/best[height<={h}][ext=mp4]"                             # best single mp4
+            f"/bestvideo[height<={h}]+bestaudio"                       # merge (needs ffmpeg)
+            f"/best[height<={h}]"                                      # absolute fallback
+        )
+        cmd = ["yt-dlp", "--no-playlist",
+               "-f", fmt,
                "--output", out_tmpl, "--newline", url]
 
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
@@ -79,31 +80,30 @@ def ytdlp_download_direct(job_id, url, quality, audio_only, audio_format):
         if "[download]" in line and "%" in line:
             try:
                 pct = float(line.split("%")[0].split()[-1])
-                jobs[job_id]["progress"] = round(min(pct, 99.9), 1)
+                jobs[job_id]["progress"] = round(min(pct, 99), 1)
             except Exception:
                 pass
     proc.wait()
 
     if proc.returncode != 0:
-        raise RuntimeError("yt-dlp falló al descargar. Intenta con otra calidad.")
+        raise RuntimeError("yt-dlp no pudo descargar este video.")
 
-    for f in os.listdir(DOWNLOAD_DIR):
+    for f in sorted(os.listdir(DOWNLOAD_DIR)):
         if f.startswith(job_id + "_"):
             fpath = os.path.join(DOWNLOAD_DIR, f)
             jobs[job_id].update({"status": "done", "progress": 100,
                                  "file": fpath, "filename": f[len(job_id)+1:]})
             return
-
-    raise RuntimeError("Archivo no encontrado después de la descarga.")
+    raise RuntimeError("Archivo no encontrado tras la descarga.")
 
 
 def download_worker(job_id, url, quality, audio_only, audio_format):
     try:
-        # Step 1: try cobalt
+        # 1) Try cobalt first
         try:
             cobalt_url, filename = cobalt_get_link(
-                url, quality=quality,
-                audio_only=audio_only, audio_format=audio_format)
+                url, quality=quality, audio_only=audio_only,
+                audio_format=audio_format)
 
             jobs[job_id]["status"] = "downloading"
             out = os.path.join(DOWNLOAD_DIR, f"{job_id}_{filename}")
@@ -122,11 +122,11 @@ def download_worker(job_id, url, quality, audio_only, audio_format):
             jobs[job_id].update({"status": "done", "progress": 100,
                                  "file": out, "filename": filename})
             return
+        except Exception:
+            pass  # cobalt failed → try yt-dlp
 
-        except Exception as cobalt_err:
-            # Step 2: fallback to yt-dlp
-            jobs[job_id]["error"] = None  # reset error
-            ytdlp_download_direct(job_id, url, quality, audio_only, audio_format)
+        # 2) Fallback: yt-dlp direct download (no ffmpeg required)
+        ytdlp_download_direct(job_id, url, quality, audio_only, audio_format)
 
     except Exception as e:
         jobs[job_id].update({"status": "error", "error": str(e)})
@@ -177,8 +177,6 @@ def get_info(url):
         raise RuntimeError(str(e))
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────────
-
 @app.route("/")
 def root():
     return jsonify({"status": "YTDown API running"})
@@ -203,20 +201,14 @@ def api_download():
     url = d.get("url", "").strip()
     if not url:
         return jsonify({"error": "URL requerida"}), 400
-
-    quality = QUALITY_MAP.get(d.get("quality_id", "1080p"), "1080")
+    quality = QUALITY_MAP.get(d.get("quality_id", "720p"), "720")
     audio_only = d.get("audio_only", False)
     audio_format = AUDIO_MAP.get(d.get("audio_format", "mp3"), "mp3")
-
     job_id = uuid.uuid4().hex[:8]
     jobs[job_id] = {"status":"queued","progress":0,"file":None,"filename":None,"error":None}
-
-    threading.Thread(
-        target=download_worker,
-        args=(job_id, url, quality, audio_only, audio_format),
-        daemon=True
-    ).start()
-
+    threading.Thread(target=download_worker,
+                     args=(job_id, url, quality, audio_only, audio_format),
+                     daemon=True).start()
     return jsonify({"job_id": job_id})
 
 @app.route("/api/status/<job_id>")
