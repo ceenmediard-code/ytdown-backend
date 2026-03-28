@@ -1,21 +1,17 @@
-import os, json, re, threading, uuid, subprocess, requests
+import os, json, re, threading, uuid, subprocess, requests, tempfile
+from flask import Flask, request, jsonify, send_file, Response, stream_with_context
+from flask_cors import CORS
 
-# ── Register static ffmpeg binary before anything else ────────────────────────
 try:
     import static_ffmpeg
     static_ffmpeg.add_paths()
 except Exception:
     pass
 
-from flask import Flask, request, jsonify, send_file
-from flask_cors import CORS
-
 app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-jobs = {}
+jobs = {}  # job_id -> {status, progress, data, filename, error}
 
 COBALT_INSTANCES = [
     "https://cobalt.lunar.icu",
@@ -32,14 +28,13 @@ QUALITY_MAP = {"2160p":"2160","1440p":"1440","1080p":"1080","720p":"720",
 AUDIO_MAP = {"mp3":"mp3","m4a":"m4a","opus":"opus","flac":"flac","wav":"wav"}
 
 
-def cobalt_get_link(url, quality="1080", audio_only=False, audio_format="mp3"):
-    if audio_only:
-        payload = {"url": url, "downloadMode": "audio",
-                   "audioFormat": audio_format, "filenameStyle": "pretty"}
-    else:
-        payload = {"url": url, "videoQuality": quality,
-                   "downloadMode": "auto", "filenameStyle": "pretty"}
-    last_err = "Ningún servidor cobalt respondió."
+def cobalt_get_link(url, quality="720", audio_only=False, audio_format="mp3"):
+    payload = ({"url": url, "downloadMode": "audio",
+                "audioFormat": audio_format, "filenameStyle": "pretty"}
+               if audio_only else
+               {"url": url, "videoQuality": quality,
+                "downloadMode": "auto", "filenameStyle": "pretty"})
+    last_err = "Sin respuesta de cobalt."
     for inst in COBALT_INSTANCES:
         try:
             r = requests.post(inst.rstrip('/') + '/',
@@ -57,84 +52,98 @@ def cobalt_get_link(url, quality="1080", audio_only=False, audio_format="mp3"):
     raise RuntimeError(last_err)
 
 
-def ytdlp_download(job_id, url, quality, audio_only, audio_format):
-    jobs[job_id]["status"] = "downloading"
-    out_tmpl = os.path.join(DOWNLOAD_DIR, f"{job_id}_%(title).60s.%(ext)s")
-
-    if audio_only:
-        cmd = ["yt-dlp", "--no-playlist",
-               "-f", "bestaudio/best",
-               "-x", "--audio-format", audio_format,
-               "--audio-quality", "0",
-               "--output", out_tmpl, "--newline", url]
-    else:
-        h = quality
-        # Priority: single mp4 file with audio → merge → best available
-        fmt = (f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
-               f"/bestvideo[height<={h}]+bestaudio"
-               f"/best[height<={h}][ext=mp4]"
-               f"/best[height<={h}]")
-        cmd = ["yt-dlp", "--no-playlist",
-               "-f", fmt,
-               "--merge-output-format", "mp4",
-               "--output", out_tmpl, "--newline", url]
-
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.STDOUT, text=True)
-    for line in proc.stdout:
-        line = line.strip()
-        if "[download]" in line and "%" in line:
-            try:
-                pct = float(line.split("%")[0].split()[-1])
-                jobs[job_id]["progress"] = round(min(pct, 99), 1)
-            except Exception:
-                pass
-    proc.wait()
-
-    if proc.returncode != 0:
-        raise RuntimeError("yt-dlp no pudo descargar el video.")
-
-    for f in sorted(os.listdir(DOWNLOAD_DIR)):
-        if f.startswith(job_id + "_"):
-            fpath = os.path.join(DOWNLOAD_DIR, f)
-            jobs[job_id].update({"status": "done", "progress": 100,
-                                 "file": fpath, "filename": f[len(job_id)+1:]})
-            return
-    raise RuntimeError("Archivo no encontrado tras la descarga.")
-
-
-def download_worker(job_id, url, quality, audio_only, audio_format):
+def download_to_memory(job_id, url, quality, audio_only, audio_format):
+    """Download file into RAM, then serve it. Works on Railway ephemeral filesystem."""
     try:
-        # 1) Try cobalt
+        jobs[job_id]["status"] = "downloading"
+        filename = "video.mp4"
+        data = None
+
+        # 1) Try cobalt — streams directly from their CDN
         try:
             cobalt_url, filename = cobalt_get_link(
                 url, quality=quality, audio_only=audio_only,
                 audio_format=audio_format)
-            jobs[job_id]["status"] = "downloading"
-            out = os.path.join(DOWNLOAD_DIR, f"{job_id}_{filename}")
+
+            buf = bytearray()
             with requests.get(cobalt_url, stream=True, timeout=180,
                               headers={"User-Agent": "Mozilla/5.0"}) as r:
                 r.raise_for_status()
                 total = int(r.headers.get("content-length", 0))
                 done = 0
-                with open(out, "wb") as f:
-                    for chunk in r.iter_content(65536):
-                        if chunk:
-                            f.write(chunk)
-                            done += len(chunk)
-                            if total:
-                                jobs[job_id]["progress"] = round(done/total*100, 1)
-            jobs[job_id].update({"status": "done", "progress": 100,
-                                 "file": out, "filename": filename})
-            return
-        except Exception:
-            pass  # cobalt failed → fallback
+                for chunk in r.iter_content(65536):
+                    if chunk:
+                        buf.extend(chunk)
+                        done += len(chunk)
+                        if total:
+                            jobs[job_id]["progress"] = round(done/total*100, 1)
+            data = bytes(buf)
 
-        # 2) yt-dlp fallback
-        ytdlp_download(job_id, url, quality, audio_only, audio_format)
+        except Exception:
+            # 2) Fallback: yt-dlp writes to temp file, we read it into memory
+            tmp_dir = tempfile.mkdtemp()
+            out_tmpl = os.path.join(tmp_dir, "%(title).60s.%(ext)s")
+            h = quality
+
+            if audio_only:
+                cmd = ["yt-dlp", "--no-playlist",
+                       "-f", "bestaudio/best",
+                       "-x", "--audio-format", audio_format,
+                       "--audio-quality", "0",
+                       "--output", out_tmpl, "--newline", url]
+            else:
+                fmt = (f"bestvideo[height<={h}][ext=mp4]+bestaudio[ext=m4a]"
+                       f"/bestvideo[height<={h}]+bestaudio"
+                       f"/best[height<={h}][ext=mp4]"
+                       f"/best[height<={h}]")
+                cmd = ["yt-dlp", "--no-playlist", "-f", fmt,
+                       "--merge-output-format", "mp4",
+                       "--output", out_tmpl, "--newline", url]
+
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                if "[download]" in line and "%" in line:
+                    try:
+                        pct = float(line.split("%")[0].split()[-1])
+                        jobs[job_id]["progress"] = round(min(pct, 98), 1)
+                    except Exception:
+                        pass
+            proc.wait()
+
+            if proc.returncode != 0:
+                raise RuntimeError("No se pudo descargar el video.")
+
+            # Find the output file
+            files = os.listdir(tmp_dir)
+            if not files:
+                raise RuntimeError("yt-dlp no generó archivo.")
+
+            out_file = os.path.join(tmp_dir, files[0])
+            filename = files[0]
+            with open(out_file, "rb") as f:
+                data = f.read()
+
+            # Cleanup temp
+            try:
+                import shutil
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+            except Exception:
+                pass
+
+        # Sanitize filename
+        filename = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', filename) or "video.mp4"
+
+        jobs[job_id].update({
+            "status": "done",
+            "progress": 100,
+            "data": data,
+            "filename": filename,
+            "error": None
+        })
 
     except Exception as e:
-        jobs[job_id].update({"status": "error", "error": str(e)})
+        jobs[job_id].update({"status": "error", "error": str(e), "data": None})
 
 
 def extract_id(url):
@@ -182,6 +191,8 @@ def get_info(url):
         raise RuntimeError(str(e))
 
 
+# ── Routes ─────────────────────────────────────────────────────────────────────
+
 @app.route("/")
 def root(): return jsonify({"status": "YTDown API running"})
 
@@ -204,8 +215,8 @@ def api_download():
     audio_only = d.get("audio_only", False)
     audio_format = AUDIO_MAP.get(d.get("audio_format", "mp3"), "mp3")
     job_id = uuid.uuid4().hex[:8]
-    jobs[job_id] = {"status":"queued","progress":0,"file":None,"filename":None,"error":None}
-    threading.Thread(target=download_worker,
+    jobs[job_id] = {"status":"queued","progress":0,"data":None,"filename":None,"error":None}
+    threading.Thread(target=download_to_memory,
                      args=(job_id, url, quality, audio_only, audio_format),
                      daemon=True).start()
     return jsonify({"job_id": job_id})
@@ -220,10 +231,28 @@ def api_status(job_id):
 @app.route("/api/file/<job_id>")
 def api_file(job_id):
     j = jobs.get(job_id)
-    if not j or j["status"] != "done" or not j["file"]:
+    if not j or j["status"] != "done" or not j.get("data"):
         return jsonify({"error": "No disponible"}), 404
-    return send_file(j["file"], as_attachment=True, download_name=j["filename"])
 
+    data = j["data"]
+    filename = j["filename"] or "video.mp4"
+
+    # Detect content type
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "mp4"
+    ct_map = {"mp4":"video/mp4","mp3":"audio/mpeg","m4a":"audio/mp4",
+              "webm":"video/webm","opus":"audio/ogg","flac":"audio/flac","wav":"audio/wav"}
+    content_type = ct_map.get(ext, "application/octet-stream")
+
+    from flask import make_response
+    resp = make_response(data)
+    resp.headers["Content-Type"] = content_type
+    resp.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    resp.headers["Content-Length"] = len(data)
+
+    # Free memory after serving
+    j["data"] = None
+
+    return resp
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
